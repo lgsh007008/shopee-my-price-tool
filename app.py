@@ -1,29 +1,63 @@
 import streamlit as st
-from streamlit_gsheets import GSheetsConnection
 import pandas as pd
 from sympy import symbols, Eq, solve, Number
 import json
 from datetime import datetime
+from sqlalchemy import create_engine, text
 
-st.set_page_config(page_title="多站点 SKU 藏价系统 (Pro版)", layout="wide")
+st.set_page_config(page_title="跨境多站点 SKU 藏价系统 (DB版)", layout="wide")
 
-# --- 1. 连接 Google Sheets ---
-conn = st.connection("gsheets", type=GSheetsConnection)
+# --- 1. 连接数据库 (Supabase) ---
+# 使用 Streamlit 提供的 SQL 连接器，它会自动读取 secrets 中的 [connections.db]
+conn = st.connection("db", type="sql")
 
+# 初始化：如果表不存在，自动创建
+def init_db():
+    with conn.session as s:
+        s.execute(text("""
+            CREATE TABLE IF NOT EXISTS orders (
+                id SERIAL PRIMARY KEY,
+                order_id TEXT NOT NULL,
+                site TEXT NOT NULL,
+                items TEXT NOT NULL,
+                total_price FLOAT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """))
+        s.commit()
+
+# 页面加载时尝试初始化表结构
+try:
+    init_db()
+except Exception as e:
+    st.error(f"数据库连接失败，请检查 Secrets 配置。错误: {e}")
+
+# --- 2. 数据读取与写入 ---
 def get_data():
     try:
-        # 读取数据，如果表头对不上或为空，返回空结构
-        df = conn.read(ttl="0s")
-        expected_cols = ['order_id', 'site', 'items', 'total_price', 'created_at']
-        # 简单的容错：如果缺少列，就补充空列
-        for col in expected_cols:
-            if col not in df.columns:
-                df[col] = pd.Series(dtype='object')
+        # 读取所有数据
+        df = conn.query("SELECT * FROM orders ORDER BY created_at DESC;", ttl=0)
         return df
     except Exception:
         return pd.DataFrame(columns=['order_id', 'site', 'items', 'total_price', 'created_at'])
 
-# --- 2. 核心解算逻辑 (逻辑不变) ---
+def save_order(order_id, site, items_dict, total_price):
+    # 构建 SQL 插入语句
+    items_json = json.dumps(items_dict)
+    with conn.session as s:
+        s.execute(
+            text("INSERT INTO orders (order_id, site, items, total_price, created_at) VALUES (:oid, :site, :items, :price, :time)"),
+            params={
+                "oid": order_id, 
+                "site": site, 
+                "items": items_json, 
+                "price": total_price,
+                "time": datetime.now()
+            }
+        )
+        s.commit()
+
+# --- 3. 核心解算逻辑 (保持不变) ---
 def solve_prices(df):
     if df.empty:
         return {}, []
@@ -33,7 +67,6 @@ def solve_prices(df):
     
     for _, row in df.iterrows():
         try:
-            # 清洗数据，确保是有效的 JSON
             item_str = str(row['items']).replace("'", '"')
             items = json.loads(item_str)
             equations_data.append({'items': items, 'total_price': float(row['total_price'])})
@@ -52,7 +85,6 @@ def solve_prices(df):
         equations.append(Eq(expr, order['total_price']))
 
     solution = solve(equations, dict=True)
-    
     solved_dict = {}
     pending_relations = []
 
@@ -68,135 +100,96 @@ def solve_prices(df):
     
     return solved_dict, pending_relations
 
-# --- 3. 界面布局 ---
-st.title("🌍 多站点 SKU 藏价推导系统 (Pro)")
+# --- 4. 界面布局 ---
+st.title("🌏 跨境电商 SKU 藏价系统 (Supabase版)")
 
-# 获取数据
-data = get_data()
-
-# --- 侧边栏：录入数据 (全新升级) ---
+# --- 侧边栏 ---
 with st.sidebar:
-    st.header("📝 录入新订单")
+    st.header("📝 新增订单")
     
-    # 1. 基础信息
-    site_input = st.text_input("站点名称", placeholder="例如 US, UK (必填)")
-    order_id_input = st.text_input("订单编号", placeholder="例如 20240101-01 (必填)")
+    site_options = ["泰国", "菲律宾", "墨西哥"]
+    site_input = st.selectbox("选择站点", site_options)
+    order_id_input = st.text_input("订单编号", placeholder="例如 TH240101")
     
-    # 2. 动态产品录入 (Data Editor)
-    st.markdown("👇 **在下方表格录入产品详情：**")
+    st.markdown("👇 **录入产品明细：**")
+    default_df = pd.DataFrame([{"产品编码": "", "数量": 1}])
     
-    # 初始化一个空的 DataFrame 模板供用户填写
-    default_df = pd.DataFrame(
-        [{"产品编码": "", "数量": 1}], # 默认给一行
-    )
-    
-    # 显示可编辑表格 (num_rows="dynamic" 允许增删行)
     edited_df = st.data_editor(
         default_df,
         column_config={
-            "产品编码": st.column_config.TextColumn("产品编码 (SKU)", required=True),
-            "数量": st.column_config.NumberColumn("数量", min_value=1, step=1, required=True)
+            "产品编码": st.column_config.TextColumn("SKU", required=True),
+            "数量": st.column_config.NumberColumn("数量", min_value=1, required=True)
         },
-        num_rows="dynamic", # 关键：允许用户新增、删除行
+        num_rows="dynamic",
         hide_index=True,
         use_container_width=True,
         key="editor"
     )
 
-    # 3. 总价输入
-    total_price = st.number_input("该订单总藏价", min_value=0.0, step=0.1)
-    
-    # 4. 提交按钮
-    submit_btn = st.button("💾 保存订单", type="primary")
+    total_price = st.number_input("订单总藏价", min_value=0.0, step=0.01, format="%.2f")
+    submit_btn = st.button("💾 保存数据", type="primary")
 
     if submit_btn:
-        # --- 校验逻辑 ---
-        if not site_input or not order_id_input:
-            st.error("❌ 请填写【站点名称】和【订单编号】")
+        if not order_id_input:
+            st.error("❌ 缺少订单编号")
         elif edited_df.empty:
-             st.error("❌ 请至少输入一个产品")
+             st.error("❌ 请至少录入一个产品")
         else:
             try:
-                # --- 数据转换 ---
-                # 将表格数据转为 JSON 格式: {"A": 1, "B": 2}
                 items_dict = {}
-                valid_items = False
-                
-                for index, row in edited_df.iterrows():
+                valid = False
+                for _, row in edited_df.iterrows():
                     sku = str(row["产品编码"]).strip()
                     qty = int(row["数量"])
-                    if sku: # 只有 SKU 不为空才记录
+                    if sku:
                         items_dict[sku] = items_dict.get(sku, 0) + qty
-                        valid_items = True
+                        valid = True
                 
-                if not valid_items:
-                    st.error("❌ 产品编码不能为空")
+                if not valid:
+                    st.error("❌ SKU不能为空")
                     st.stop()
 
-                # --- 写入数据库 ---
-                new_row = pd.DataFrame([{
-                    "order_id": order_id_input.strip(),
-                    "site": site_input.upper().strip(),
-                    "items": json.dumps(items_dict),
-                    "total_price": total_price,
-                    "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                }])
-                
-                updated_df = pd.concat([data, new_row], ignore_index=True)
-                conn.update(data=updated_df)
-                
-                st.success(f"✅ 订单 {order_id_input} 保存成功！")
-                st.rerun() # 刷新页面
-                
+                save_order(order_id_input.strip(), site_input, items_dict, total_price)
+                st.success(f"✅ 保存成功！")
+                st.rerun() # 刷新页面获取最新数据
             except Exception as e:
                 st.error(f"保存失败: {e}")
 
-# --- 主界面：查看结果 ---
+# --- 主界面 ---
+data = get_data()
 
-if 'site' in data.columns and not data.empty and len(data) > 0:
-    # 获取所有站点
-    unique_sites = data['site'].dropna().unique()
-    if len(unique_sites) > 0:
-        selected_site = st.selectbox("📊 请选择要分析的站点：", unique_sites)
-        
-        # 过滤数据
-        site_data = data[data['site'] == selected_site]
-        
-        if not site_data.empty:
-            solved, pending = solve_prices(site_data)
+if not data.empty:
+    existing_sites = data['site'].unique().tolist()
+    all_site_options = sorted(list(set(site_options + existing_sites)))
+    
+    st.divider()
+    selected_view_site = st.selectbox("📊 选择站点查看数据：", all_site_options)
+    
+    site_data = data[data['site'] == selected_view_site]
+    
+    if not site_data.empty:
+        solved, pending = solve_prices(site_data)
 
-            st.markdown(f"### 📍 站点：{selected_site}")
-            
-            # 展示计算结果
-            col1, col2 = st.columns(2)
-            with col1:
-                st.subheader("✅ 已推导出的 SKU 藏价")
-                if solved:
-                    # 格式化显示
-                    res_df = pd.DataFrame(list(solved.items()), columns=['SKU', '单个藏价'])
-                    st.dataframe(res_df.style.format({"单个藏价": "{:.2f}"}), use_container_width=True)
-                else:
-                    st.info("数据量不足，暂无确切解。")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("✅ 已计算藏价")
+            if solved:
+                df_res = pd.DataFrame(list(solved.items()), columns=['SKU', '单价'])
+                st.dataframe(df_res.style.format({"单价": "{:.2f}"}), use_container_width=True)
+            else:
+                st.warning("⚠️ 数据不足或有冲突，无法计算")
 
-            with col2:
-                st.subheader("🔗 待定关系 / 需要更多数据")
-                if pending:
-                    for p in pending:
-                        st.warning(f"📐 {p}")
-                else:
-                    st.success("无待定关系，所有涉及的 SKU 均已解出（或未录入）。")
+        with col2:
+            st.subheader("🔗 待定关系")
+            if pending:
+                for p in pending:
+                    st.info(f"📐 {p}")
+            else:
+                st.write("无")
 
-            st.divider()
-            
-            # 展示历史记录 (只看需要的列)
-            st.subheader(f"📂 {selected_site} 站点的历史订单")
-            display_cols = ['order_id', 'items', 'total_price', 'created_at']
-            # 确保列存在防止报错
-            existing_display_cols = [c for c in display_cols if c in site_data.columns]
-            st.dataframe(site_data[existing_display_cols].sort_values(by='created_at', ascending=False), use_container_width=True)
-        else:
-            st.info(f"站点 {selected_site} 暂无数据。")
+        st.subheader("📂 历史订单")
+        st.dataframe(site_data[['order_id', 'items', 'total_price', 'created_at']], use_container_width=True)
     else:
-         st.info("暂无站点数据。")
+        st.info(f"{selected_view_site} 暂无数据")
 else:
-    st.info("👋 欢迎！请在左侧录入第一笔订单。")
+    st.info("👋 数据库为空，请开始录入。")
