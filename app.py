@@ -4,14 +4,16 @@ import numpy as np
 from datetime import datetime
 from supabase import create_client, Client
 from sympy import symbols, Eq, solve, Matrix
+from scipy.linalg import lstsq
 
-st.set_page_config(page_title="SKU藏价求解器-符号代数版", layout="wide")
+st.set_page_config(page_title="SKU藏价求解器-智能版", layout="wide")
 
 st.markdown("""
 <style>
     .block-container {padding-top: 3rem !important;}
-    .constraint-box {background-color: #fff3cd; border-left: 4px solid #ffc107; padding: 10px; margin: 5px 0;}
-    .solved-box {background-color: #d1ecf1; border-left: 4px solid #17a2b8; padding: 10px; margin: 5px 0;}
+    .constraint-box {background-color: #fff3cd; border-left: 4px solid #ffc107; padding: 8px; margin: 5px 0; border-radius: 4px;}
+    .exact-box {background-color: #d4edda; border-left: 4px solid #28a745; padding: 8px; margin: 5px 0; border-radius: 4px;}
+    .avg-box {background-color: #f8d7da; border-left: 4px solid #dc3545; padding: 8px; margin: 5px 0; border-radius: 4px;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -21,9 +23,10 @@ def init_supabase() -> Client:
     key = st.secrets["SUPABASE_KEY"]
     return create_client(url, key)
 
-class SymbolicSolver:
+class SmartSolver:
     def __init__(self):
         self.supabase = init_supabase()
+        self.safety_factor = 1.05  # 矛盾时放大系数
     
     def add_order(self, site: str, order_id: str, total_hidden_price: float, items: list):
         try:
@@ -59,108 +62,149 @@ class SymbolicSolver:
             return False
     
     def get_site_data(self, site: str):
-        orders = self.supabase.table('orders').select("*").eq('site', site).execute().data
-        items = self.supabase.table('order_items').select("*").eq('site', site).execute().data
+        orders = self.supabase.table('orders').select("*").eq('site', site).execute().data or []
+        items = self.supabase.table('order_items').select("*").eq('site', site).execute().data or []
         return orders, items
     
-    def solve_symbolic(self, site: str):
-        """核心：使用SymPy符号求解"""
+    def solve_smart(self, site: str):
+        """
+        智能求解策略：
+        1. 先尝试符号精确求解（获得确定值和约束关系）
+        2. 如果符号求解失败（矛盾方程组），退回到最小二乘（平均）+ 放大
+        3. 同时保留约束关系显示
+        """
         orders, items = self.get_site_data(site)
-        
         if not orders:
-            return {}, [], []  # 确定解, 约束关系, 原始订单
+            return {}, [], [], []  # 确定值, 约束, 统计, 订单
         
-        # 收集所有SKU
-        all_skus = sorted(list(set([item['sku'] for item in items])))
+        all_skus = sorted(list(set([it['sku'] for it in items])))
         if not all_skus:
-            return {}, [], orders
+            return {}, [], [], orders
         
-        # 创建符号变量
-        symbols_map = {sku: symbols(sku) for sku in all_skus}
-        
-        # 构建方程组
-        equations = []
-        for order in orders:
-            order_items = [it for it in items if it['order_id'] == order['order_id']]
-            expr = sum(it['quantity'] * symbols_map[it['sku']] for it in order_items)
-            equations.append(Eq(expr, order['total_hidden_price']))
-        
-        # 求解
-        solution = solve(equations, list(symbols_map.values()), dict=True)
-        
-        determined = {}      # 已确定的具体数值
-        constraints = []     # 欠定约束关系（如 2D + E = 100）
-        free_vars = []       # 自由变量列表
-        
-        if solution:
-            sol = solution[0]  # 取第一个解（如果有多个，它们等价）
-            
-            # 分析每个变量
-            for sku in all_skus:
-                var = symbols_map[sku]
-                if var in sol:
-                    val = sol[var]
-                    # 检查是具体数字还是表达式
-                    if val.is_number:
-                        determined[sku] = float(val)
-                    else:
-                        # 是表达式（包含其他变量），视为欠定
-                        constraints.append(f"{sku} = {val}")
-                        if sku not in free_vars:
-                            free_vars.append(sku)
-                else:
-                    # 变量不在解中，说明是自由变量
-                    free_vars.append(sku)
-        
-        # 如果没有得到显式解（可能系统欠定且无显式表达式），使用矩阵方法提取约束
-        if not determined and not constraints and free_vars:
-            constraints = self._extract_matrix_constraints(orders, items, all_skus)
-        
-        return determined, constraints, orders
-    
-    def _extract_matrix_constraints(self, orders, items, all_skus):
-        """从矩阵提取约束关系（当sympy返回空时备用）"""
+        # 构建矩阵（用于矛盾检测和最小二乘）
         sku_idx = {s: i for i, s in enumerate(all_skus)}
-        n_skus = len(all_skus)
-        n_orders = len(orders)
+        n_skus, n_orders = len(all_skus), len(orders)
         
-        # 构建矩阵
         A = np.zeros((n_orders, n_skus))
         b = np.zeros(n_orders)
         
         for i, order in enumerate(orders):
             b[i] = order['total_hidden_price']
-            order_items = [it for it in items if it['order_id'] == order['order_id']]
-            for it in order_items:
-                A[i, sku_idx[it['sku']]] = it['quantity']
+            for it in items:
+                if it['order_id'] == order['order_id'] and it['sku'] in sku_idx:
+                    A[i, sku_idx[it['sku']]] = it['quantity']
         
-        # 计算行最简形
+        # 尝试符号求解
+        symbols_map = {sku: symbols(sku) for sku in all_skus}
+        equations = []
+        for i, order in enumerate(orders):
+            order_items = [it for it in items if it['order_id'] == order['order_id']]
+            expr = sum(it['quantity'] * symbols_map[it['sku']] for it in order_items)
+            equations.append(Eq(expr, order['total_hidden_price']))
+        
+        try:
+            sym_solution = solve(equations, list(symbols_map.values()), dict=True)
+        except:
+            sym_solution = []
+        
+        determined = {}      # SKU -> (值, 计算方式)
+        constraints = []     # 约束关系式
+        
+        # 分析符号解
+        has_exact_solution = False
+        if sym_solution and len(sym_solution) > 0:
+            sol = sym_solution[0]
+            all_numeric = True
+            
+            for sku in all_skus:
+                var = symbols_map[sku]
+                if var in sol:
+                    val = sol[var]
+                    if val.is_number:
+                        determined[sku] = (float(val), "exact")
+                        has_exact_solution = True
+                    else:
+                        # 是表达式（含其他变量）
+                        constraints.append(f"{sku} = {val}")
+                        all_numeric = False
+                else:
+                    # 自由变量，从约束中提取
+                    all_numeric = False
+            
+            # 如果符号求解给出完整数值解，直接返回（无矛盾）
+            if has_exact_solution and all_numeric:
+                return determined, constraints, [], orders
+        
+        # 如果符号求解失败或部分欠定，使用最小二乘（处理矛盾）
+        # 这对应"同一个SKU在不同订单推出不同价格"的情况 -> 取平均
+        if n_orders >= n_skus or not has_exact_solution:
+            x, residuals, rank, s = lstsq(A, b)
+            x = np.maximum(x, 0)  # 非负
+            
+            # 检测矛盾：如果残差很大，说明数据矛盾，需要放大
+            has_conflict = False
+            if isinstance(residuals, (list, np.ndarray)) and len(residuals) > 0:
+                has_conflict = residuals[0] > 1e-6
+            elif isinstance(residuals, (int, float)):
+                has_conflict = residuals > 1e-6
+            
+            method = "avg_conflict" if has_conflict else "fitted"
+            
+            # 如果之前有符号解的部分确定值，优先用符号解（更精确）
+            # 剩下的用最小二乘填充
+            for i, sku in enumerate(all_skus):
+                if sku not in determined:  # 未被符号求解确定
+                    val = float(x[i])
+                    if has_conflict:
+                        val = val * self.safety_factor  # 放大
+                    determined[sku] = (val, method)
+        
+        # 提取约束关系（用于显示欠定情况）
+        if constraints or not has_exact_solution:
+            constraints = self._extract_constraints_rref(A, b, all_skus, determined)
+        
+        return determined, constraints, [], orders
+    
+    def _extract_constraints_rref(self, A, b, all_skus, determined):
+        """从行最简形提取约束关系"""
         M = Matrix(np.hstack([A, b.reshape(-1, 1)]))
         rref_matrix, pivot_cols = M.rref()
         
         constraints = []
-        # 从rref提取方程
+        determined_skus = set(determined.keys())
+        
         for row in rref_matrix.tolist():
             coeffs = row[:-1]
             const = row[-1]
             
-            # 只保留非零行
-            if any(abs(c) > 1e-10 for c in coeffs):
-                terms = []
-                for i, c in enumerate(coeffs):
-                    if abs(c) > 1e-10:
-                        c_str = f"{int(c) if c == int(c) else f'{c:.2f}'}"
-                        terms.append(f"{c_str}{all_skus[i]}")
-                
-                if terms:
-                    expr = " + ".join(terms).replace("+ -", "- ")
-                    constraints.append(f"{expr} = {float(const):.2f}")
+            if abs(float(const)) < 1e-10 and all(abs(float(c)) < 1e-10 for c in coeffs):
+                continue
+            
+            terms = []
+            unknown_part = []
+            known_sum = 0
+            
+            for i, c in enumerate(coeffs):
+                c_float = float(c)
+                if abs(c_float) > 1e-10:
+                    sku = all_skus[i]
+                    if sku in determined_skus:
+                        known_sum += c_float * determined[sku][0]
+                    else:
+                        c_str = f"{int(c_float) if c_float == int(c_float) else f'{c_float:.1f}'}"
+                        unknown_part.append(f"{c_str}{sku}")
+            
+            remaining = float(const) - known_sum
+            
+            if unknown_part and abs(remaining) > 1e-10:
+                expr = " + ".join(unknown_part).replace("+ -", "- ")
+                constraints.append(f"{expr} = {remaining:.2f}")
         
         return constraints
 
 # ============ 界面 ============
 try:
-    solver = SymbolicSolver()
+    solver = SmartSolver()
 except Exception as e:
     st.error(f"连接失败: {e}")
     st.stop()
@@ -182,15 +226,18 @@ def remove_row(index):
 st.title("📦 SKU 藏价求解器")
 
 # 站点选择
-existing_sites = list(set([o['site'] for o in solver.supabase.table('orders').select("site").execute().data or []]))
-site_options = existing_sites + ["+ 新建站点"]
-
 cols = st.columns([1, 3])
 with cols[0]:
     st.markdown("**选择站点**")
 with cols[1]:
-    selected = st.selectbox("", site_options, 
-                           index=site_options.index(st.session_state.current_site) if st.session_state.current_site in site_options else 0)
+    existing_sites = list(set([o['site'] for o in solver.supabase.table('orders').select("site").execute().data or []]))
+    site_options = existing_sites + ["+ 新建站点"]
+    
+    index = 0
+    if st.session_state.current_site in site_options:
+        index = site_options.index(st.session_state.current_site)
+    
+    selected = st.selectbox("", site_options, index=index)
 
 if selected == "+ 新建站点":
     new_site = st.text_input("输入新站点代码")
@@ -236,9 +283,12 @@ with left:
         total = st.number_input("订单总藏价", min_value=0.0, value=0.0, step=10.0, format="%.2f")
         
         if st.button("🚀 提交并求解", type="primary", use_container_width=True):
-            if not order_id: st.error("请输入订单编号")
-            elif not items: st.error("请输入产品编码")
-            elif total <= 0: st.error("总藏价必须大于0")
+            if not order_id: 
+                st.error("请输入订单编号")
+            elif not items: 
+                st.error("请输入产品编码")
+            elif total <= 0: 
+                st.error("总藏价必须大于0")
             else:
                 success, msg = solver.add_order(site, order_id, total, items)
                 if success:
@@ -249,32 +299,52 @@ with left:
                     st.error(msg)
 
 with right:
-    determined, constraints, orders = solver.solve_symbolic(site)
+    determined, constraints, _, orders = solver.solve_smart(site)
     
     # 统计
+    exact_count = sum(1 for v, m in determined.values() if m == "exact")
+    avg_count = sum(1 for v, m in determined.values() if m in ["avg_conflict", "fitted"])
+    
     c1, c2, c3 = st.columns(3)
-    c1.metric("已确定SKU", len(determined))
-    c2.metric("约束关系", len(constraints))
+    c1.metric("精确确定", exact_count)
+    c2.metric("平均估算", avg_count)
     c3.metric("历史订单", len(orders))
     
     st.divider()
     
+    # 显示结果
     if determined:
-        st.subheader("✅ 已确定藏价")
-        df_det = pd.DataFrame(list(determined.items()), columns=['SKU', '藏价'])
-        df_det['藏价'] = df_det['藏价'].apply(lambda x: f"{x:.2f}")
-        st.dataframe(df_det, use_container_width=True, hide_index=True)
+        st.subheader("计算结果")
+        
+        # 分类显示
+        exact_items = {k: v for k, (v, m) in determined.items() if m == "exact"}
+        avg_items = {k: (v, m) for k, (v, m) in determined.items() if m != "exact"}
+        
+        if exact_items:
+            st.markdown("<div class='exact-box'><strong>✅ 精确解（方程组一致）</strong></div>", unsafe_allow_html=True)
+            df_exact = pd.DataFrame(list(exact_items.items()), columns=['SKU', '藏价'])
+            df_exact['藏价'] = df_exact['藏价'].apply(lambda x: f"{x:.2f}")
+            st.dataframe(df_exact, use_container_width=True, hide_index=True)
+        
+        if avg_items:
+            st.markdown("<div class='avg-box'><strong>⚠️ 平均估算（数据矛盾，已放大5%）</strong></div>", unsafe_allow_html=True)
+            df_avg = pd.DataFrame([(k, f"{v:.2f}", "是" if m == "avg_conflict" else "否") 
+                                  for k, (v, m) in avg_items.items()], 
+                                 columns=['SKU', '藏价', '是否矛盾'])
+            st.dataframe(df_avg, use_container_width=True, hide_index=True)
+            
+            st.caption("💡 同一个SKU在不同订单中推出了不同价格，已取平均并保守放大")
     
     if constraints:
-        st.subheader("🔗 待求解约束（需更多订单）")
+        st.subheader("🔗 待求解约束（欠定）")
         for cons in constraints:
             st.markdown(f"<div class='constraint-box'>📌 {cons}</div>", unsafe_allow_html=True)
-        st.caption("💡 录入只包含这些未知SKU的订单，即可解除约束求得确切值")
+        st.caption("💡 录入只包含这些未知SKU的订单，即可求得确切值")
     
     if not determined and not constraints:
         st.info("录入第一个订单后开始计算")
     
-    # 历史订单（带删除）
+    # 历史订单
     if orders:
         st.divider()
         st.subheader("📋 历史订单")
