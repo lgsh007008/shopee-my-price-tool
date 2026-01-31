@@ -110,7 +110,10 @@ class SiteSolver:
         orders, items, manual = self.db.get_site_data(site)
         if not orders:
             return {}, {}, [], [], [], []
-        return self._solve_logic(orders, items, manual)
+        
+        # 调用求解逻辑，确保返回6个值
+        result = self._solve_logic(orders, items, manual)
+        return result
     
     def _solve_logic(self, orders, items, manual_prices):
         order_map = {o['order_id']: {'total': o['total_hidden_price'], 'items': []} for o in orders}
@@ -147,11 +150,33 @@ class SiteSolver:
                 
                 remaining = total - known_sum
                 
+                # ================== 核心修复开始 ==================
                 if len(unknown_items) == 0:
                     if abs(remaining) > 0.01:
-                        if len(o_items) == 1 and o_items[0]['sku'] in manual_skus:
-                            continue
+                        # 修复：如果订单只有一个SKU，且与已确定值矛盾
+                        if len(o_items) == 1:
+                            sku = o_items[0]['sku']
+                            qty = o_items[0]['quantity']
+                            # 只处理非手动确认的SKU（手动确认的是"真理"，不应报矛盾）
+                            if sku not in manual_skus and qty > 0:
+                                implied_price = total / qty
+                                current_price = determined.get(sku, 0)
+                                # 检查是否与当前确定值显著不同
+                                if abs(current_price - implied_price) > 0.01:
+                                    if sku not in conflicts:
+                                        conflicts[sku] = []
+                                    conflict_info = {
+                                        'value': implied_price,
+                                        'derived_from': oid,
+                                        'equation': f"{qty}×{sku} = {total:.2f} (订单{oid})",
+                                        'current': current_price,
+                                        'type': 'order_mismatch'
+                                    }
+                                    # 避免重复添加相似的值
+                                    if not any(abs(c['value'] - implied_price) < 0.01 for c in conflicts[sku]):
+                                        conflicts[sku].append(conflict_info)
                     continue
+                # ================== 核心修复结束 ==================
                 
                 if len(unknown_items) == 1:
                     sku, qty = unknown_items[0]
@@ -181,6 +206,7 @@ class SiteSolver:
                         determined[sku] = val
                         changed = True
         
+        # 过滤掉手动确认的SKU的矛盾（不再显示）
         conflicts = {k: v for k, v in conflicts.items() if k not in manual_skus}
         
         constraints = []
@@ -203,6 +229,7 @@ class SiteSolver:
                         'missing_skus': [sku for _, sku in unknown_terms]
                     })
         
+        # 统一返回格式：6个值，确保变量名正确
         return determined, conflicts, constraints, list(underdetermined), orders, inconsistent_orders
 
 try:
@@ -287,7 +314,7 @@ with left:
                     label_visibility="collapsed"
                 )
             with c2:
-                # 数量：无默认值（显示为空或最小值1，但用户需要输入）
+                # 注意：Streamlit number_input 必须有默认值，这里保持1但视觉上提示用户检查
                 qty = st.number_input(
                     f"数量_{i}", 
                     min_value=1, 
@@ -308,11 +335,11 @@ with left:
             add_row()
             st.rerun()
         
-        # 订单总藏价：无默认值，显示为0但可编辑
+        # 订单总藏价：默认0，必须手动修改
         total = st.number_input(
             "订单总藏价", 
             min_value=0.0, 
-            value=0.0,  # 默认0，用户必须修改为实际值
+            value=0.0,
             step=10.0, 
             format="%.2f",
             placeholder="0.00"
@@ -327,11 +354,11 @@ with left:
                 st.error("总藏价必须大于0")
             else:
                 try:
-                    success, msg = solver.db.add_order(site, order_id, total, items)
+                    success, msg = solver.db.add_order(site, order_id.strip(), total, items)
                     if success:
                         st.session_state.success_message = "订单已保存"
                         st.session_state.sku_rows = [{"sku": "", "qty": 1}]
-                        st.session_state.order_id_input = ""  # 清空订单号
+                        st.session_state.order_id_input = ""
                         st.rerun()
                     else:
                         st.error(msg)
@@ -339,6 +366,7 @@ with left:
                     st.error(f"保存失败: {e}")
 
 with right:
+    # 确保接收6个返回值，使用 _ 忽略最后一个（inconsistent_orders）
     try:
         determined, conflicts, constraints, underdetermined, orders, _ = solver.solve(site)
     except Exception as e:
@@ -367,6 +395,7 @@ with right:
                 st.markdown("---")
                 st.markdown("**手动确认最终值：**")
                 
+                # 计算默认值（平均值）
                 default_val = sum(c['value'] for c in conflict_list) / len(conflict_list)
                 
                 cols_input = st.columns([2, 1])
@@ -415,7 +444,10 @@ with right:
                 st.markdown(f"**订单 {cons['order_id']}**: {cons['equation']}")
                 st.caption(f"涉及待定SKU: {', '.join(cons['missing_skus'])}")
     
-    if not determined and not conflicts and not constraints:
+    if not determined and not conflicts and not constraints and orders:
+        st.info("数据不足以确定藏价，请继续录入订单")
+    
+    if not orders:
         st.info("录入第一个订单后开始计算")
     
     if orders:
@@ -443,7 +475,7 @@ with right:
                 with col3:
                     st.markdown(f"{order['total_hidden_price']:.2f}")
                 with col4:
-                    ckey = f"del_{oid}"
+                    ckey = f"del_show_{oid}"
                     if ckey not in st.session_state.delete_confirm:
                         st.session_state.delete_confirm[ckey] = False
                     
