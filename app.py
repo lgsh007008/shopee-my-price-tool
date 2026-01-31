@@ -109,7 +109,7 @@ class SiteSolver:
     def solve(self, site: str):
         orders, items, manual = self.db.get_site_data(site)
         if not orders:
-            return {}, {}, [], [], []
+            return {}, {}, [], [], [], []
         return self._solve_logic(orders, items, manual)
     
     def _solve_logic(self, orders, items, manual_prices):
@@ -119,11 +119,10 @@ class SiteSolver:
                 order_map[it['order_id']]['items'].append(it)
         
         all_skus = list(set(it['sku'] for it in items))
-        determined = dict(manual_prices)  # 手动确认值优先
-        conflicts = {}  # 矛盾记录：sku -> [可能值列表]
-        inconsistent_orders = []  # 数据不一致的订单
+        determined = dict(manual_prices)
+        conflicts = {}
+        inconsistent_orders = []
         
-        # 迭代求解直到没有新值
         changed = True
         iteration = 0
         while changed and iteration < 50:
@@ -147,11 +146,8 @@ class SiteSolver:
                 
                 remaining = total - known_sum
                 
-                # 关键修复1：检查是否所有SKU都已确定但总价不匹配（数据矛盾）
                 if len(unknown_items) == 0:
-                    if abs(remaining) > 0.01:  # 总价不匹配
-                        # 这意味着已确定的SKU值无法解释此订单的总价
-                        # 如果订单只有一个SKU，这就是该SKU的矛盾
+                    if abs(remaining) > 0.01:
                         if len(o_items) == 1:
                             sku = o_items[0]['sku']
                             qty = o_items[0]['quantity']
@@ -166,20 +162,10 @@ class SiteSolver:
                                 'current_src': '已确定值',
                                 'type': 'order_mismatch'
                             }
-                            # 避免重复添加相同的矛盾
                             if not any(abs(c['value'] - implied_price) < 0.01 for c in conflicts[sku]):
                                 conflicts[sku].append(conflict_info)
-                        else:
-                            # 多个SKU都已确定但总价不对，记录为不一致订单
-                            inconsistent_orders.append({
-                                'order_id': oid,
-                                'expected': known_sum,
-                                'actual': total,
-                                'diff': remaining
-                            })
-                    continue  # 无需进一步处理
+                    continue
                 
-                # 只有一个未知数，可以求解
                 if len(unknown_items) == 1:
                     sku, qty = unknown_items[0]
                     if qty == 0:
@@ -187,7 +173,6 @@ class SiteSolver:
                     else:
                         val = remaining / qty
                     
-                    # 关键修复2：如果该SKU已有确定值，检查是否矛盾
                     if sku in determined:
                         old_val = determined[sku]
                         if abs(old_val - val) > 0.01:
@@ -204,11 +189,9 @@ class SiteSolver:
                             if not any(abs(c['value'] - val) < 0.01 for c in conflicts[sku]):
                                 conflicts[sku].append(conflict_info)
                     else:
-                        # 新确定值
                         determined[sku] = val
                         changed = True
         
-        # 收集欠定约束（多个未知数）
         constraints = []
         underdetermined = set(all_skus) - set(determined.keys())
         
@@ -231,7 +214,7 @@ class SiteSolver:
         
         return determined, conflicts, constraints, list(underdetermined), orders, inconsistent_orders
 
-# ============ 界面 ============
+# ============ 初始化 ============
 try:
     solver = SiteSolver()
 except Exception as e:
@@ -240,12 +223,18 @@ except Exception as e:
 
 SITES = {'MX': '🇲🇽 墨西哥', 'TH': '🇹🇭 泰国', 'PH': '🇵🇭 菲律宾'}
 
+# Session State 初始化
 if 'sku_rows' not in st.session_state:
     st.session_state.sku_rows = [{"sku": "", "qty": 1}]
 if 'delete_confirm' not in st.session_state:
     st.session_state.delete_confirm = {}
 if 'current_site' not in st.session_state:
     st.session_state.current_site = 'MX'
+# 新增：用于强制刷新
+if 'force_refresh' not in st.session_state:
+    st.session_state.force_refresh = False
+if 'success_message' not in st.session_state:
+    st.session_state.success_message = None
 
 def add_row():
     st.session_state.sku_rows.append({"sku": "", "qty": 1})
@@ -259,12 +248,23 @@ st.markdown("""
 <style>
     .block-container {padding-top: 2rem !important;}
     .conflict-box {background-color: #f8d7da; border: 2px solid #dc3545; padding: 15px; margin: 10px 0; border-radius: 8px;}
-    .warning-box {background-color: #fff3cd; border-left: 4px solid #ffc107; padding: 10px; margin: 5px 0;}
 </style>
 """, unsafe_allow_html=True)
 
 st.title("📦 SKU 藏价求解器")
 
+# 检查是否需要强制刷新（处理手动确认后）
+if st.session_state.force_refresh:
+    st.session_state.force_refresh = False
+    st.rerun()
+
+# 显示保存成功的消息
+if st.session_state.success_message:
+    st.success(st.session_state.success_message)
+    st.session_state.success_message = None
+    time.sleep(0.5)  # 给用户看到消息的时间
+
+# 站点选择
 cols = st.columns(3)
 for i, (key, label) in enumerate(SITES.items()):
     with cols[i]:
@@ -314,7 +314,7 @@ with left:
                 try:
                     success, msg = solver.db.add_order(site, order_id, total, items)
                     if success:
-                        st.success("已保存")
+                        st.session_state.success_message = "订单已保存"
                         st.session_state.sku_rows = [{"sku": "", "qty": 1}]
                         st.rerun()
                     else:
@@ -329,13 +329,13 @@ with right:
         st.error(f"计算失败: {e}")
         determined, conflicts, constraints, underdetermined, orders, inconsistent = {}, {}, [], [], [], []
     
-    # 显示统计数据
+    # 统计
     c1, c2, c3 = st.columns(3)
     c1.metric("已确定SKU", len(determined))
     c2.metric("矛盾待解决", len(conflicts))
     c3.metric("历史订单", len(orders))
     
-    # 显示矛盾警告（红色大框）
+    # 显示矛盾（关键修复区域）
     if conflicts:
         st.markdown("---")
         st.error("⚠️ 发现价格矛盾！以下SKU推导出多个不同值")
@@ -344,43 +344,55 @@ with right:
             with st.container(border=True):
                 st.markdown(f"#### SKU: {sku}")
                 
-                # 显示所有可能的值
                 for i, c in enumerate(conflict_list, 1):
                     st.markdown(f"**推导{i}**: {c['value']:.2f} ({c['equation']})")
                 
-                # 显示当前采用的值
                 current_val = determined.get(sku, "未确定")
                 st.markdown(f"**当前系统保留值**: {current_val if isinstance(current_val, str) else f'{current_val:.2f}'}")
                 
-                # 手动确认输入
                 st.markdown("---")
                 st.markdown("**手动确认最终值：**")
+                
+                # 计算默认值（平均值）
+                default_val = sum(c['value'] for c in conflict_list) / len(conflict_list)
+                
                 cols = st.columns([2, 1])
                 with cols[0]:
-                    # 默认取平均值或第一个冲突值
-                    default_val = sum(c['value'] for c in conflict_list) / len(conflict_list)
                     new_price = st.number_input(
-                        f"确认 {sku} 的藏价", 
+                        f"确认_{sku}", 
                         min_value=0.0,
                         value=float(default_val),
                         step=0.5,
-                        key=f"manual_{sku}"
+                        key=f"manual_input_{sku}",
+                        label_visibility="collapsed"
                     )
                 with cols[1]:
-                    if st.button(f"✓ 确认", key=f"confirm_{sku}", type="primary", use_container_width=True):
+                    # 关键修复：使用session state跟踪点击
+                    btn_key = f"confirm_btn_{sku}"
+                    if st.button(f"✓ 确认", key=btn_key, type="primary", use_container_width=True):
                         try:
-                            solver.db.set_manual_price(site, sku, new_price)
-                            st.success(f"已确认 {sku} = {new_price:.2f}")
-                            st.rerun()
+                            with st.spinner("保存中..."):
+                                success = solver.db.set_manual_price(site, sku, new_price)
+                                if success:
+                                    st.session_state.success_message = f"已确认 {sku} = {new_price:.2f}"
+                                    st.session_state.force_refresh = True  # 标记需要刷新
+                                    st.rerun()  # 立即刷新
+                                else:
+                                    st.error("保存失败")
                         except Exception as e:
-                            st.error(f"失败: {e}")
+                            st.error(f"错误: {e}")
                 
+                # 清除按钮
                 if st.button(f"🗑️ 清除手动确认", key=f"clear_{sku}"):
-                    solver.db.clear_manual_price(site, sku)
-                    st.rerun()
+                    try:
+                        solver.db.clear_manual_price(site, sku)
+                        st.session_state.success_message = f"已清除 {sku} 的手动确认"
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"清除失败: {e}")
     
-    # 显示已确定价格
-    if determined and not conflicts:  # 没有矛盾时才显示确定列表（避免混淆）
+    # 显示已确定（只在无矛盾时显示，避免混淆）
+    elif determined:
         st.markdown("---")
         st.subheader("✅ 已确定藏价")
         data = [{"SKU": k, "藏价": f"{v:.2f}"} for k, v in determined.items()]
@@ -391,10 +403,14 @@ with right:
         st.markdown("---")
         st.subheader("🔗 欠定约束（需更多数据）")
         for cons in constraints:
-            st.info(f"订单 {cons['order_id']}: {cons['equation']}")
-        st.caption(f"涉及待定SKU: {', '.join(underdetermined)}")
+            with st.container(border=True):
+                st.markdown(f"**订单 {cons['order_id']}**: {cons['equation']}")
+                st.caption(f"涉及: {', '.join(cons['missing_skus'])}")
     
-    # 显示历史订单
+    if not determined and not conflicts and not constraints:
+        st.info("录入第一个订单后开始计算")
+    
+    # 历史订单
     if orders:
         st.markdown("---")
         st.subheader("📋 历史订单")
@@ -427,9 +443,13 @@ with right:
                             st.rerun()
                     else:
                         if st.button("✓", key=f"yes_{oid}", type="primary"):
-                            solver.db.delete_order(site, oid)
-                            st.session_state.delete_confirm[ckey] = False
-                            st.rerun()
+                            try:
+                                solver.db.delete_order(site, oid)
+                                st.session_state.delete_confirm[ckey] = False
+                                st.session_state.success_message = "订单已删除"
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"删除失败: {e}")
                         if st.button("✕", key=f"no_{oid}"):
                             st.session_state.delete_confirm[ckey] = False
                             st.rerun()
