@@ -6,19 +6,19 @@ from scipy.linalg import lstsq
 from scipy.optimize import linprog
 from supabase import create_client, Client
 
-st.set_page_config(page_title="SKU藏价求解器", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="SKU藏价求解器", layout="wide")
 
-# 自定义 CSS
+# 自定义 CSS - 增加顶部padding避开Streamlit Cloud状态条
 st.markdown("""
 <style>
-    .block-container {padding-top: 1rem; padding-bottom: 2rem;}
+    .block-container {padding-top: 3rem !important; padding-bottom: 2rem;}
     .stButton>button {border-radius: 6px;}
     div[data-testid="stMetricValue"] {font-size: 1.6rem;}
+    .site-selector {background-color: #f0f2f6; padding: 1rem; border-radius: 8px; margin-bottom: 1rem;}
 </style>
 """, unsafe_allow_html=True)
 
-# ============ 数据库层 ============
-
+# ============ 数据库层（同上，省略重复代码）===========
 @st.cache_resource
 def init_supabase() -> Client:
     url = st.secrets["SUPABASE_URL"]
@@ -149,7 +149,6 @@ class MultiSiteSolver:
         return pd.DataFrame(prices), pd.DataFrame(orders)
 
 # ============ 初始化 ============
-
 try:
     solver = MultiSiteSolver()
 except Exception as e:
@@ -171,215 +170,205 @@ def remove_row(index):
     if len(st.session_state.sku_rows) > 1:
         st.session_state.sku_rows.pop(index)
 
-# ============ 界面 ============
+# ============ 主界面 ============
+st.title("📦 SKU 藏价求解器")
 
-# 顶部导航
-cols = st.columns([6, 4])
-with cols[0]:
-    st.title("📦 SKU 藏价求解器")
-with cols[1]:
-    existing_sites = solver.get_sites()
-    site_options = existing_sites + ["+ 新建站点"]
-    
-    index = 0
-    if st.session_state.current_site in site_options:
-        index = site_options.index(st.session_state.current_site)
-    
-    selected = st.selectbox("选择站点", site_options, index=index, label_visibility="collapsed")
-    
-    if selected == "+ 新建站点":
-        new_site = st.text_input("新站点代码", placeholder="如：MY、SG")
-        if new_site:
-            st.session_state.current_site = new_site.upper()
-    else:
-        st.session_state.current_site = selected
-
-if not st.session_state.current_site:
-    st.info("👆 请选择或创建一个站点开始")
-    st.stop()
-
-site = st.session_state.current_site
-
-# 主体布局
-left_col, right_col = st.columns([5, 7])
-
-# ========== 左侧输入 ==========
-with left_col:
-    st.subheader("📝 录入订单")
-    st.markdown("---")
-    
-    order_id = st.text_input("订单编号", 
-                            value=f"{site}{datetime.now().strftime('%m%d%H%M')}",
-                            key="order_id")
-    
-    st.markdown("**商品明细**")
-    items = []
-    
-    for i, row in enumerate(st.session_state.sku_rows):
-        c1, c2, c3 = st.columns([4, 2, 1])
+# 站点选择区（放在标题下方，避开顶部状态条）
+with st.container():
+    cols = st.columns([2, 3])
+    with cols[0]:
+        st.markdown("**当前站点**")
+        existing_sites = solver.get_sites()
+        site_options = existing_sites + ["+ 新建站点"]
         
-        with c1:
-            sku = st.text_input(f"产品编码_{i}", value=row["sku"], 
-                               key=f"sku_{i}", placeholder="SKU001",
-                               label_visibility="collapsed")
-        with c2:
-            qty = st.number_input(f"数量_{i}", min_value=1, value=row["qty"], 
-                                 key=f"qty_{i}", label_visibility="collapsed")
-        with c3:
-            if len(st.session_state.sku_rows) > 1:
-                if st.button("✕", key=f"del_row_{i}"):
-                    remove_row(i)
-                    st.rerun()
+        index = 0
+        if st.session_state.current_site in site_options:
+            index = site_options.index(st.session_state.current_site)
         
-        if sku.strip():
-            items.append({"sku": sku.strip().upper(), "qty": int(qty)})
-    
-    if st.button("➕ 添加商品行", type="secondary", use_container_width=True):
-        add_row()
-        st.rerun()
-    
-    total = st.number_input("订单总藏价", min_value=0.0, value=0.0, step=10.0, 
-                           key="total_price", format="%.2f")
-    
-    if st.button("🚀 提交计算", type="primary", use_container_width=True):
-        if not order_id:
-            st.error("请输入订单编号")
-        elif len(items) == 0:
-            st.error("请至少输入一个产品编码")
-        elif total <= 0:
-            st.error("总藏价必须大于0")
+        selected = st.selectbox("选择站点", site_options, index=index, label_visibility="collapsed")
+        
+        if selected == "+ 新建站点":
+            new_site = st.text_input("输入新站点代码（如：MY、SG）", key="new_site_input")
+            if new_site:
+                st.session_state.current_site = new_site.strip().upper()
         else:
-            with st.spinner("计算中..."):
-                success, msg = solver.add_order(site, order_id, total, items)
-                if success:
-                    st.success("已保存")
-                    st.session_state.sku_rows = [{"sku": "", "qty": 1}]
+            st.session_state.current_site = selected
+    
+    with cols[1]:
+        if st.session_state.current_site and st.session_state.current_site not in ["+ 新建站点", ""]:
+            st.markdown(f"**正在管理: {st.session_state.current_site}**")
+            if st.button("🗑️ 清空此站点所有数据", type="secondary"):
+                confirm = st.text_input(f"输入站点名 {st.session_state.current_site} 确认删除", key="confirm_clear")
+                if confirm == st.session_state.current_site:
+                    solver.delete_order(st.session_state.current_site, "%")  # 实现批量删除需调整方法
+                    st.success("已清空")
                     st.rerun()
-                else:
-                    st.error(msg)
 
-# ========== 右侧结果 ==========
-with right_col:
-    prices_df, orders_df = solver.get_site_status(site)
+if not st.session_state.current_site or st.session_state.current_site in ["+ 新建站点", ""]:
+    st.info("👆 请在上方选择或创建站点")
+else:
+    site = st.session_state.current_site
     
-    # 统计卡片
-    if not prices_df.empty:
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            det_count = len(prices_df[prices_df['status'] == 'determined'])
-            st.metric("已确定产品", f"{det_count}")
-        with c2:
-            undet_count = len(prices_df[prices_df['status'] == 'underdetermined'])
-            st.metric("待定产品", f"{undet_count}" if undet_count else "0")
-        with c3:
-            st.metric("历史订单", f"{len(orders_df)}")
-        
-        st.markdown("---")
+    # 主体布局
+    left_col, right_col = st.columns([5, 7])
     
-    # 价格表格
-    if not prices_df.empty:
-        tab1, tab2 = st.tabs(["✅ 已确定", "🔍 待定"])
-        
-        with tab1:
-            det = prices_df[prices_df['status'] == 'determined']
-            if not det.empty:
-                display_df = det[['sku', 'unit_price', 'confidence']].copy()
-                display_df.columns = ['产品编码', '单件藏价', '数据支撑']
-                display_df['单件藏价'] = display_df['单件藏价'].apply(lambda x: f"{x:.2f}")
-                st.dataframe(display_df, use_container_width=True, hide_index=True, height=250)
-                
-                if 'avg' in det['calc_method'].values:
-                    st.caption("💡 该站点存在矛盾数据，已自动取平均并放大5%")
-            else:
-                st.info("暂无确定价格")
-        
-        with tab2:
-            undet = prices_df[prices_df['status'] == 'underdetermined']
-            if not undet.empty:
-                for _, row in undet.iterrows():
-                    cols = st.columns([3, 2, 3])
-                    with cols[0]:
-                        st.markdown(f"**{row['sku']}**")
-                    with cols[1]:
-                        st.markdown(f"{row['unit_price']:.2f}")
-                    with cols[2]:
-                        if pd.notna(row['max_possible']):
-                            st.caption(f"范围: {row['min_possible']:.2f} - {row['max_possible']:.2f}")
-                        else:
-                            st.caption("需更多数据")
-            else:
-                st.success("所有产品价格已确定")
-    else:
-        st.info("录入订单后将在此显示计算结果")
-    
-    # 历史订单
-    if not orders_df.empty:
-        st.markdown("---")
-        st.subheader("📋 历史订单")
-        
-        all_items = solver.supabase.table('order_items').select("*").eq('site', site).execute().data
-        items_map = {}
-        for item in all_items:
-            oid = item['order_id']
-            if oid not in items_map:
-                items_map[oid] = []
-            items_map[oid].append(f"{item['sku']}×{item['quantity']}")
-        
-        for _, order in orders_df.iterrows():
-            oid = order['order_id']
+    # ========== 左侧输入 ==========
+    with left_col:
+        with st.container(border=True):
+            st.subheader("📝 录入新订单")
             
-            with st.container():
-                cols = st.columns([3, 4, 2, 2])
+            order_id = st.text_input("订单编号", 
+                                    value=f"{site}{datetime.now().strftime('%m%d%H%M')}",
+                                    key="order_id")
+            
+            st.markdown("**商品明细**")
+            items = []
+            
+            for i, row in enumerate(st.session_state.sku_rows):
+                c1, c2, c3 = st.columns([4, 2, 1])
                 
-                with cols[0]:
-                    st.markdown(f"**{oid}**")
-                    st.caption(f"{order['created_at'][:10]}")
-                
-                with cols[1]:
-                    if oid in items_map:
-                        goods_text = " | ".join(items_map[oid])
-                        st.text(goods_text[:35] + "..." if len(goods_text) > 35 else goods_text)
-                
-                with cols[2]:
-                    st.markdown(f"**{order['total_hidden_price']:.2f}**")
-                
-                with cols[3]:
-                    confirm_key = f"confirm_{oid}"
-                    if confirm_key not in st.session_state.delete_confirm:
-                        st.session_state.delete_confirm[confirm_key] = False
-                    
-                    if not st.session_state.delete_confirm[confirm_key]:
-                        if st.button("删除", key=f"del_btn_{oid}"):
-                            st.session_state.delete_confirm[confirm_key] = True
+                with c1:
+                    sku = st.text_input(f"sku_{i}", value=row["sku"], 
+                                       key=f"sku_{i}", placeholder="产品编码",
+                                       label_visibility="collapsed")
+                with c2:
+                    qty = st.number_input(f"qty_{i}", min_value=1, value=row["qty"], 
+                                         key=f"qty_{i}", label_visibility="collapsed")
+                with c3:
+                    if len(st.session_state.sku_rows) > 1:
+                        if st.button("✕", key=f"del_row_{i}"):
+                            remove_row(i)
                             st.rerun()
-                    else:
-                        c1, c2 = st.columns(2)
-                        with c1:
-                            if st.button("✓", key=f"yes_{oid}", type="primary"):
-                                if solver.delete_order(site, oid):
+                
+                if sku.strip():
+                    items.append({"sku": sku.strip().upper(), "qty": int(qty)})
+            
+            if st.button("➕ 添加商品行", type="secondary", use_container_width=True):
+                add_row()
+                st.rerun()
+            
+            total = st.number_input("订单总藏价", min_value=0.0, value=0.0, step=10.0, 
+                                   key="total_price", format="%.2f")
+            
+            if st.button("🚀 提交计算", type="primary", use_container_width=True):
+                if not order_id:
+                    st.error("请输入订单编号")
+                elif len(items) == 0:
+                    st.error("请至少输入一个产品编码")
+                elif total <= 0:
+                    st.error("总藏价必须大于0")
+                else:
+                    with st.spinner("计算中..."):
+                        success, msg = solver.add_order(site, order_id, total, items)
+                        if success:
+                            st.success("已保存并重新计算")
+                            st.session_state.sku_rows = [{"sku": "", "qty": 1}]
+                            st.rerun()
+                        else:
+                            st.error(msg)
+    
+    # ========== 右侧结果 ==========
+    with right_col:
+        prices_df, orders_df = solver.get_site_status(site)
+        
+        # 统计卡片
+        if not prices_df.empty:
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                det_count = len(prices_df[prices_df['status'] == 'determined'])
+                st.metric("已确定产品", f"{det_count}")
+            with c2:
+                undet_count = len(prices_df[prices_df['status'] == 'underdetermined'])
+                st.metric("待定产品", f"{undet_count}" if undet_count else "0")
+            with c3:
+                st.metric("历史订单", f"{len(orders_df)}")
+            
+            st.divider()
+        
+        # 价格表格
+        if not prices_df.empty:
+            tab1, tab2 = st.tabs(["✅ 已确定", "🔍 待定"])
+            
+            with tab1:
+                det = prices_df[prices_df['status'] == 'determined']
+                if not det.empty:
+                    display_df = det[['sku', 'unit_price', 'confidence']].copy()
+                    display_df.columns = ['产品编码', '单件藏价', '数据支撑']
+                    display_df['单件藏价'] = display_df['单件藏价'].apply(lambda x: f"{x:.2f}")
+                    st.dataframe(display_df, use_container_width=True, hide_index=True, height=250)
+                    
+                    if 'avg' in det['calc_method'].values:
+                        st.caption("💡 该站点存在矛盾数据，已自动取平均并放大5%")
+                else:
+                    st.info("暂无确定价格")
+            
+            with tab2:
+                undet = prices_df[prices_df['status'] == 'underdetermined']
+                if not undet.empty:
+                    for _, row in undet.iterrows():
+                        cols = st.columns([3, 2, 3])
+                        with cols[0]:
+                            st.markdown(f"**{row['sku']}**")
+                        with cols[1]:
+                            st.markdown(f"{row['unit_price']:.2f}")
+                        with cols[2]:
+                            if pd.notna(row['max_possible']):
+                                st.caption(f"范围: {row['min_possible']:.2f} - {row['max_possible']:.2f}")
+                            else:
+                                st.caption("需更多数据")
+                else:
+                    st.success("所有产品价格已确定")
+        else:
+            st.info("录入订单后将在此显示计算结果")
+        
+        # 历史订单（带删除）
+        if not orders_df.empty:
+            st.divider()
+            st.subheader("📋 历史订单")
+            
+            all_items = solver.supabase.table('order_items').select("*").eq('site', site).execute().data
+            items_map = {}
+            for item in all_items:
+                oid = item['order_id']
+                if oid not in items_map:
+                    items_map[oid] = []
+                items_map[oid].append(f"{item['sku']}×{item['quantity']}")
+            
+            for _, order in orders_df.iterrows():
+                oid = order['order_id']
+                
+                with st.container(border=True):
+                    cols = st.columns([3, 4, 2, 2])
+                    
+                    with cols[0]:
+                        st.markdown(f"**{oid}**")
+                        st.caption(f"{order['created_at'][:10]}")
+                    
+                    with cols[1]:
+                        if oid in items_map:
+                            goods_text = " | ".join(items_map[oid])
+                            st.text(goods_text[:30] + "..." if len(goods_text) > 30 else goods_text)
+                    
+                    with cols[2]:
+                        st.markdown(f"{order['total_hidden_price']:.2f}")
+                    
+                    with cols[3]:
+                        confirm_key = f"confirm_{oid}"
+                        if confirm_key not in st.session_state.delete_confirm:
+                            st.session_state.delete_confirm[confirm_key] = False
+                        
+                        if not st.session_state.delete_confirm[confirm_key]:
+                            if st.button("删除", key=f"del_btn_{oid}"):
+                                st.session_state.delete_confirm[confirm_key] = True
+                                st.rerun()
+                        else:
+                            c1, c2 = st.columns(2)
+                            with c1:
+                                if st.button("✓", key=f"yes_{oid}", type="primary"):
+                                    if solver.delete_order(site, oid):
+                                        st.session_state.delete_confirm[confirm_key] = False
+                                        st.rerun()
+                            with c2:
+                                if st.button("✕", key=f"no_{oid}"):
                                     st.session_state.delete_confirm[confirm_key] = False
                                     st.rerun()
-                        with c2:
-                            if st.button("✕", key=f"no_{oid}"):
-                                st.session_state.delete_confirm[confirm_key] = False
-                                st.rerun()
-            st.markdown("")  # 间距
-
-# 跨站点对比
-if len(solver.get_sites()) > 1:
-    with st.expander("📊 跨站点价格对比"):
-        all_sites = solver.get_sites()
-        comparison = []
-        for s in all_sites:
-            df, _ = solver.get_site_status(s)
-            if not df.empty:
-                for _, row in df.iterrows():
-                    comparison.append({
-                        "站点": s, "产品": row['sku'],
-                        "藏价": f"{row['unit_price']:.2f}",
-                        "状态": "确定" if row['status'] == 'determined' else "待定"
-                    })
-        if comparison:
-            comp_df = pd.DataFrame(comparison)
-            pivot = comp_df.pivot(index='产品', columns='站点', values='藏价').fillna('-')
-            st.dataframe(pivot, use_container_width=True)
