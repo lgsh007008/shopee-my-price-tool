@@ -119,11 +119,9 @@ class SiteSolver:
                 order_map[it['order_id']]['items'].append(it)
         
         all_skus = list(set(it['sku'] for it in items))
-        determined = dict(manual_prices)  # 手动确认值优先
+        determined = dict(manual_prices)
         conflicts = {}
         inconsistent_orders = []
-        
-        # 记录手动确认的SKU集合（方案B：后续不对这些SKU检测矛盾）
         manual_skus = set(manual_prices.keys())
         
         changed = True
@@ -149,16 +147,12 @@ class SiteSolver:
                 
                 remaining = total - known_sum
                 
-                # 验证：所有SKU都已确定（包含手动）
                 if len(unknown_items) == 0:
                     if abs(remaining) > 0.01:
-                        # 如果订单只有一个SKU且是手动的，按方案B忽略矛盾（信任用户）
                         if len(o_items) == 1 and o_items[0]['sku'] in manual_skus:
                             continue
-                        # 否则记录不一致（但这里只记录，不显示为矛盾）
                     continue
                 
-                # 只有一个未知数，可求解
                 if len(unknown_items) == 1:
                     sku, qty = unknown_items[0]
                     if qty == 0:
@@ -168,11 +162,9 @@ class SiteSolver:
                     
                     if sku in determined:
                         old_val = determined[sku]
-                        # 关键修改：如果是手动确认的SKU，完全信任，不检测矛盾（方案B）
                         if sku in manual_skus:
-                            continue  # 跳过矛盾检测，保留手动值
+                            continue
                         
-                        # 非手动SKU才检测矛盾
                         if abs(old_val - val) > 0.01:
                             if sku not in conflicts:
                                 conflicts[sku] = []
@@ -189,10 +181,8 @@ class SiteSolver:
                         determined[sku] = val
                         changed = True
         
-        # 再次过滤：确保手动确认的SKU不出现在矛盾列表中（双重保险）
         conflicts = {k: v for k, v in conflicts.items() if k not in manual_skus}
         
-        # 收集欠定约束
         constraints = []
         underdetermined = set(all_skus) - set(determined.keys())
         
@@ -213,9 +203,8 @@ class SiteSolver:
                         'missing_skus': [sku for _, sku in unknown_terms]
                     })
         
-        return determined, conflicts, constraints, list(underdetermined), orders, inconsistent
+        return determined, conflicts, constraints, list(underdetermined), orders, inconsistent_orders
 
-# ============ 初始化 ============
 try:
     solver = SiteSolver()
 except Exception as e:
@@ -234,6 +223,8 @@ if 'force_refresh' not in st.session_state:
     st.session_state.force_refresh = False
 if 'success_message' not in st.session_state:
     st.session_state.success_message = None
+if 'order_id_input' not in st.session_state:
+    st.session_state.order_id_input = ""
 
 def add_row():
     st.session_state.sku_rows.append({"sku": "", "qty": 1})
@@ -276,18 +267,39 @@ left, right = st.columns([4, 6])
 with left:
     st.subheader("📝 录入新订单")
     with st.container(border=True):
-        order_id = st.text_input("订单编号", value=f"{site}{datetime.now().strftime('%m%d%H%M')}")
+        # 订单编号：无默认值，需手动输入
+        order_id = st.text_input(
+            "订单编号", 
+            value=st.session_state.order_id_input,
+            placeholder="输入订单编号",
+            key="order_id_field"
+        )
         
         items = []
         for i, row in enumerate(st.session_state.sku_rows):
             c1, c2, c3 = st.columns([3, 2, 1])
             with c1:
-                sku = st.text_input(f"sku_{i}", value=row["sku"], key=f"sku_{i}", placeholder="如: A", label_visibility="collapsed")
+                sku = st.text_input(
+                    f"产品编码_{i}", 
+                    value=row["sku"], 
+                    key=f"sku_{i}", 
+                    placeholder="如: SKU001",
+                    label_visibility="collapsed"
+                )
             with c2:
-                qty = st.number_input(f"qty_{i}", min_value=1, value=row["qty"], key=f"qty_{i}", label_visibility="collapsed")
+                # 数量：无默认值（显示为空或最小值1，但用户需要输入）
+                qty = st.number_input(
+                    f"数量_{i}", 
+                    min_value=1, 
+                    value=1, 
+                    step=1,
+                    key=f"qty_{i}", 
+                    label_visibility="collapsed"
+                )
             with c3:
-                if len(st.session_state.sku_rows) > 1 and st.button("✕", key=f"del_{i}"):
-                    remove_row(i)
+                if len(st.session_state.sku_rows) > 1:
+                    if st.button("✕", key=f"del_{i}"):
+                        remove_row(i)
             
             if sku.strip():
                 items.append({"sku": sku.strip().upper(), "qty": qty})
@@ -296,10 +308,18 @@ with left:
             add_row()
             st.rerun()
         
-        total = st.number_input("订单总藏价", min_value=0.0, value=0.0, step=10.0, format="%.2f")
+        # 订单总藏价：无默认值，显示为0但可编辑
+        total = st.number_input(
+            "订单总藏价", 
+            min_value=0.0, 
+            value=0.0,  # 默认0，用户必须修改为实际值
+            step=10.0, 
+            format="%.2f",
+            placeholder="0.00"
+        )
         
         if st.button("🚀 提交订单", type="primary", use_container_width=True):
-            if not order_id: 
+            if not order_id.strip(): 
                 st.error("请输入订单编号")
             elif not items: 
                 st.error("请输入产品编码")
@@ -311,6 +331,7 @@ with left:
                     if success:
                         st.session_state.success_message = "订单已保存"
                         st.session_state.sku_rows = [{"sku": "", "qty": 1}]
+                        st.session_state.order_id_input = ""  # 清空订单号
                         st.rerun()
                     else:
                         st.error(msg)
@@ -329,7 +350,6 @@ with right:
     c2.metric("矛盾待解决", len(conflicts))
     c3.metric("历史订单", len(orders))
     
-    # 显示矛盾（已过滤手动确认的）
     if conflicts:
         st.markdown("---")
         st.error("⚠️ 发现价格矛盾！以下SKU推导出多个不同值")
@@ -349,8 +369,8 @@ with right:
                 
                 default_val = sum(c['value'] for c in conflict_list) / len(conflict_list)
                 
-                cols = st.columns([2, 1])
-                with cols[0]:
+                cols_input = st.columns([2, 1])
+                with cols_input[0]:
                     new_price = st.number_input(
                         f"确认_{sku}", 
                         min_value=0.0,
@@ -359,7 +379,7 @@ with right:
                         key=f"manual_input_{sku}",
                         label_visibility="collapsed"
                     )
-                with cols[1]:
+                with cols_input[1]:
                     if st.button(f"✓ 确认", key=f"confirm_{sku}", type="primary", use_container_width=True):
                         try:
                             with st.spinner("保存中..."):
@@ -381,24 +401,11 @@ with right:
                     except Exception as e:
                         st.error(f"清除失败: {e}")
     
-    # 显示已确定（手动确认后只显示在这里）
-    if determined:
+    if determined and not conflicts:
         st.markdown("---")
-        st.subheader("✅ 已确定藏价（含手动确认）")
-        
-        # 分离手动和自动
-        manual_items = {k: v for k, v in determined.items() if k in solver.solve(site)[0] and k not in conflicts}  # 简化显示
-        
-        data = []
-        for sku, val in determined.items():
-            if sku in conflicts:
-                continue  # 有矛盾的单独显示，不在这里重复
-            # 检查是否是手动确认（通过查询manual_prices）
-            # 注意：这里简单处理，实际上determined里的都是已确定的
-            data.append({"SKU": sku, "藏价": f"{val:.2f}"})
-        
-        if data:
-            st.dataframe(pd.DataFrame(data), use_container_width=True, hide_index=True)
+        st.subheader("✅ 已确定藏价")
+        data = [{"SKU": k, "藏价": f"{v:.2f}"} for k, v in determined.items()]
+        st.dataframe(pd.DataFrame(data), use_container_width=True, hide_index=True)
     
     if constraints:
         st.markdown("---")
@@ -411,7 +418,6 @@ with right:
     if not determined and not conflicts and not constraints:
         st.info("录入第一个订单后开始计算")
     
-    # 历史订单
     if orders:
         st.markdown("---")
         st.subheader("📋 历史订单")
