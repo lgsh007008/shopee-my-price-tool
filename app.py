@@ -3,13 +3,11 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 from supabase import create_client, Client
-from collections import defaultdict
 import time
 from functools import wraps
 
 st.set_page_config(page_title="SKU藏价求解器", layout="wide")
 
-# ============ 自动重试装饰器 ============
 def retry_on_error(max_retries=3, delay=1):
     def decorator(func):
         @wraps(func)
@@ -19,7 +17,7 @@ def retry_on_error(max_retries=3, delay=1):
                     return func(*args, **kwargs)
                 except Exception as e:
                     error_str = str(e)
-                    if "Resource temporarily unavailable" in error_str or "Errno 11" in error_str or "unavailable" in error_str:
+                    if "Resource temporarily unavailable" in error_str or "Errno 11" in error_str:
                         if attempt < max_retries - 1:
                             time.sleep(delay * (attempt + 1))
                             continue
@@ -28,7 +26,6 @@ def retry_on_error(max_retries=3, delay=1):
         return wrapper
     return decorator
 
-# ============ 延迟初始化 + 连接管理 ============
 class SupabaseManager:
     _client = None
     _last_used = None
@@ -37,22 +34,16 @@ class SupabaseManager:
     def get_client(cls):
         now = datetime.now().timestamp()
         if cls._client is None or (cls._last_used and now - cls._last_used > 300):
-            try:
-                url = st.secrets["SUPABASE_URL"]
-                key = st.secrets["SUPABASE_KEY"]
-                cls._client = create_client(url, key)
-                cls._last_used = now
-            except Exception as e:
-                st.error(f"数据库连接失败: {e}")
-                raise e
+            url = st.secrets["SUPABASE_URL"].strip()
+            key = st.secrets["SUPABASE_KEY"].strip()
+            cls._client = create_client(url, key)
+            cls._last_used = now
         return cls._client
     
     @classmethod
     def reset(cls):
         cls._client = None
-        cls._last_used = None
 
-# ============ 数据库操作类 ============
 class SymbolicSolver:
     def __init__(self):
         self._client = None
@@ -65,74 +56,52 @@ class SymbolicSolver:
     
     @retry_on_error(max_retries=3, delay=2)
     def add_order(self, site: str, order_id: str, total: float, items: list):
-        try:
-            existing = self.client.table('orders').select("*").eq('site', site).eq('order_id', order_id).execute()
-            if existing.data:
-                return False, "订单号已存在"
-            
-            self.client.table('orders').insert({
-                "site": site, "order_id": order_id,
-                "total_hidden_price": total,
-                "created_at": datetime.now().isoformat()
-            }).execute()
-            
-            batch = [{
-                "site": site, "order_id": order_id,
-                "sku": item['sku'].upper().strip(),
-                "quantity": int(item['qty'])
-            } for item in items if item['sku']]
-            
-            if batch:
-                self.client.table('order_items').insert(batch).execute()
-            
-            return True, "保存成功"
-        except Exception as e:
-            if "Resource" in str(e) or "Errno" in str(e):
-                SupabaseManager.reset()
-            raise e
+        existing = self.client.table('orders').select("*").eq('site', site).eq('order_id', order_id).execute()
+        if existing.data:
+            return False, "订单号已存在"
+        
+        self.client.table('orders').insert({
+            "site": site, "order_id": order_id,
+            "total_hidden_price": total,
+            "created_at": datetime.now().isoformat()
+        }).execute()
+        
+        batch = [{
+            "site": site, "order_id": order_id,
+            "sku": item['sku'].upper().strip(),
+            "quantity": int(item['qty'])
+        } for item in items if item['sku']]
+        
+        if batch:
+            self.client.table('order_items').insert(batch).execute()
+        return True, "保存成功"
     
     @retry_on_error(max_retries=3, delay=2)
     def delete_order(self, site: str, order_id: str):
-        try:
-            self.client.table('order_items').delete().eq('site', site).eq('order_id', order_id).execute()
-            self.client.table('orders').delete().eq('site', site).eq('order_id', order_id).execute()
-            return True
-        except Exception as e:
-            SupabaseManager.reset()
-            raise e
+        self.client.table('order_items').delete().eq('site', site).eq('order_id', order_id).execute()
+        self.client.table('orders').delete().eq('site', site).eq('order_id', order_id).execute()
+        return True
     
     @retry_on_error(max_retries=3, delay=2)
     def set_manual_price(self, site: str, sku: str, price: float):
-        try:
-            self.client.table('manual_prices').upsert({
-                "site": site, "sku": sku, "manual_price": price,
-                "confirmed_at": datetime.now().isoformat()
-            }).execute()
-            return True
-        except Exception as e:
-            SupabaseManager.reset()
-            raise e
+        self.client.table('manual_prices').upsert({
+            "site": site, "sku": sku, "manual_price": price,
+            "confirmed_at": datetime.now().isoformat()
+        }).execute()
+        return True
     
     @retry_on_error(max_retries=3, delay=2)
     def clear_manual_price(self, site: str, sku: str):
-        try:
-            self.client.table('manual_prices').delete().eq('site', site).eq('sku', sku).execute()
-            return True
-        except:
-            return False
+        self.client.table('manual_prices').delete().eq('site', site).eq('sku', sku).execute()
+        return True
     
     @retry_on_error(max_retries=3, delay=2)
     def get_site_data(self, site: str):
-        try:
-            orders = self.client.table('orders').select("*").eq('site', site).execute().data or []
-            items = self.client.table('order_items').select("*").eq('site', site).execute().data or []
-            manual = self.client.table('manual_prices').select("*").eq('site', site).execute().data or []
-            return orders, items, {m['sku']: m['manual_price'] for m in manual}
-        except Exception as e:
-            SupabaseManager.reset()
-            raise e
+        orders = self.client.table('orders').select("*").eq('site', site).execute().data or []
+        items = self.client.table('order_items').select("*").eq('site', site).execute().data or []
+        manual = self.client.table('manual_prices').select("*").eq('site', site).execute().data or []
+        return orders, items, {m['sku']: m['manual_price'] for m in manual}
 
-# ============ 求解算法类 ============
 class SiteSolver:
     def __init__(self):
         self.db = SymbolicSolver()
@@ -144,21 +113,17 @@ class SiteSolver:
         return self._solve_logic(orders, items, manual)
     
     def _solve_logic(self, orders, items, manual_prices):
-        order_map = {}
-        for o in orders:
-            order_map[o['order_id']] = {'total': o['total_hidden_price'], 'items': []}
+        order_map = {o['order_id']: {'total': o['total_hidden_price'], 'items': []} for o in orders}
         for it in items:
             if it['order_id'] in order_map:
                 order_map[it['order_id']]['items'].append(it)
         
         all_skus = list(set(it['sku'] for it in items))
-        determined = {}
-        conflicts = {}
-        constraints = []
+        determined = dict(manual_prices)  # 手动确认值优先
+        conflicts = {}  # 矛盾记录：sku -> [可能值列表]
+        inconsistent_orders = []  # 数据不一致的订单
         
-        for sku, price in manual_prices.items():
-            determined[sku] = (price, "manual")
-        
+        # 迭代求解直到没有新值
         changed = True
         iteration = 0
         while changed and iteration < 50:
@@ -176,12 +141,45 @@ class SiteSolver:
                     sku = it['sku']
                     qty = it['quantity']
                     if sku in determined:
-                        known_sum += qty * determined[sku][0]
+                        known_sum += qty * determined[sku]
                     else:
                         unknown_items.append((sku, qty))
                 
                 remaining = total - known_sum
                 
+                # 关键修复1：检查是否所有SKU都已确定但总价不匹配（数据矛盾）
+                if len(unknown_items) == 0:
+                    if abs(remaining) > 0.01:  # 总价不匹配
+                        # 这意味着已确定的SKU值无法解释此订单的总价
+                        # 如果订单只有一个SKU，这就是该SKU的矛盾
+                        if len(o_items) == 1:
+                            sku = o_items[0]['sku']
+                            qty = o_items[0]['quantity']
+                            implied_price = total / qty if qty != 0 else 0
+                            if sku not in conflicts:
+                                conflicts[sku] = []
+                            conflict_info = {
+                                'value': implied_price,
+                                'derived_from': oid,
+                                'equation': f"{qty}×{sku} = {total} (订单总价)",
+                                'current': determined[sku],
+                                'current_src': '已确定值',
+                                'type': 'order_mismatch'
+                            }
+                            # 避免重复添加相同的矛盾
+                            if not any(abs(c['value'] - implied_price) < 0.01 for c in conflicts[sku]):
+                                conflicts[sku].append(conflict_info)
+                        else:
+                            # 多个SKU都已确定但总价不对，记录为不一致订单
+                            inconsistent_orders.append({
+                                'order_id': oid,
+                                'expected': known_sum,
+                                'actual': total,
+                                'diff': remaining
+                            })
+                    continue  # 无需进一步处理
+                
+                # 只有一个未知数，可以求解
                 if len(unknown_items) == 1:
                     sku, qty = unknown_items[0]
                     if qty == 0:
@@ -189,68 +187,58 @@ class SiteSolver:
                     else:
                         val = remaining / qty
                     
+                    # 关键修复2：如果该SKU已有确定值，检查是否矛盾
                     if sku in determined:
-                        old_val, old_src = determined[sku]
+                        old_val = determined[sku]
                         if abs(old_val - val) > 0.01:
                             if sku not in conflicts:
                                 conflicts[sku] = []
                             conflict_info = {
                                 'value': val,
                                 'derived_from': oid,
-                                'equation': f"{qty}×{sku} = {remaining:.2f} (订单{oid})",
+                                'equation': f"{qty}×{sku} = {remaining:.2f} (基于订单{oid})",
                                 'current': old_val,
-                                'current_src': old_src
+                                'current_src': '之前确定',
+                                'type': 'derivation_conflict'
                             }
                             if not any(abs(c['value'] - val) < 0.01 for c in conflicts[sku]):
                                 conflicts[sku].append(conflict_info)
                     else:
-                        determined[sku] = (val, f"derived_{oid}")
+                        # 新确定值
+                        determined[sku] = val
                         changed = True
         
-        underdetermined_skus = set(all_skus) - set(determined.keys())
+        # 收集欠定约束（多个未知数）
+        constraints = []
+        underdetermined = set(all_skus) - set(determined.keys())
         
-        if underdetermined_skus:
+        if underdetermined:
             for oid, data in order_map.items():
                 total = data['total']
                 o_items = data['items']
                 
-                known_sum = 0
-                unknown_terms = []
-                missing_skus = []
-                
-                for it in o_items:
-                    sku = it['sku']
-                    qty = it['quantity']
-                    if sku in determined:
-                        known_sum += qty * determined[sku][0]
-                    else:
-                        unknown_terms.append(f"{qty}×{sku}")
-                        missing_skus.append(sku)
-                
+                known_sum = sum(it['quantity'] * determined[it['sku']] for it in o_items if it['sku'] in determined)
+                unknown_terms = [(it['quantity'], it['sku']) for it in o_items if it['sku'] not in determined]
                 remaining = total - known_sum
                 
                 if len(unknown_terms) >= 2:
-                    equation = " + ".join(unknown_terms) + f" = {remaining:.2f}"
+                    equation = " + ".join([f"{qty}×{sku}" for qty, sku in unknown_terms]) + f" = {remaining:.2f}"
                     constraints.append({
                         'order_id': oid,
                         'equation': equation,
-                        'missing_skus': missing_skus
+                        'missing_skus': [sku for _, sku in unknown_terms]
                     })
         
-        return determined, conflicts, constraints, list(underdetermined_skus), orders
+        return determined, conflicts, constraints, list(underdetermined), orders, inconsistent_orders
 
-# ============ 界面初始化 ============
+# ============ 界面 ============
 try:
     solver = SiteSolver()
 except Exception as e:
     st.error(f"初始化失败: {e}")
     st.stop()
 
-SITES = {
-    'MX': '🇲🇽 墨西哥',
-    'TH': '🇹🇭 泰国', 
-    'PH': '🇵🇭 菲律宾'
-}
+SITES = {'MX': '🇲🇽 墨西哥', 'TH': '🇹🇭 泰国', 'PH': '🇵🇭 菲律宾'}
 
 if 'sku_rows' not in st.session_state:
     st.session_state.sku_rows = [{"sku": "", "qty": 1}]
@@ -267,18 +255,14 @@ def remove_row(index):
         st.session_state.sku_rows.pop(index)
         st.rerun()
 
-# ============ CSS ============
 st.markdown("""
 <style>
     .block-container {padding-top: 2rem !important;}
     .conflict-box {background-color: #f8d7da; border: 2px solid #dc3545; padding: 15px; margin: 10px 0; border-radius: 8px;}
-    .exact-box {background-color: #d1ecf1; border-left: 4px solid #17a2b8; padding: 10px; margin: 5px 0;}
-    .constraint-box {background-color: #fff3cd; border-left: 4px solid #ffc107; padding: 10px; margin: 5px 0;}
-    .derived-box {background-color: #d4edda; border-left: 4px solid #28a745; padding: 10px; margin: 5px 0;}
+    .warning-box {background-color: #fff3cd; border-left: 4px solid #ffc107; padding: 10px; margin: 5px 0;}
 </style>
 """, unsafe_allow_html=True)
 
-# ============ 主界面 ============
 st.title("📦 SKU 藏价求解器")
 
 cols = st.columns(3)
@@ -303,13 +287,12 @@ with left:
         for i, row in enumerate(st.session_state.sku_rows):
             c1, c2, c3 = st.columns([3, 2, 1])
             with c1:
-                sku = st.text_input(f"产品编码_{i}", value=row["sku"], key=f"sku_{i}", placeholder="如: A", label_visibility="collapsed")
+                sku = st.text_input(f"sku_{i}", value=row["sku"], key=f"sku_{i}", placeholder="如: A", label_visibility="collapsed")
             with c2:
-                qty = st.number_input(f"数量_{i}", min_value=1, value=row["qty"], key=f"qty_{i}", label_visibility="collapsed")
+                qty = st.number_input(f"qty_{i}", min_value=1, value=row["qty"], key=f"qty_{i}", label_visibility="collapsed")
             with c3:
-                if len(st.session_state.sku_rows) > 1:
-                    if st.button("✕", key=f"del_{i}"):
-                        remove_row(i)
+                if len(st.session_state.sku_rows) > 1 and st.button("✕", key=f"del_{i}"):
+                    remove_row(i)
             
             if sku.strip():
                 items.append({"sku": sku.strip().upper(), "qty": qty})
@@ -328,112 +311,100 @@ with left:
             elif total <= 0: 
                 st.error("总藏价必须大于0")
             else:
-                with st.spinner("保存中..."):
-                    try:
-                        success, msg = solver.db.add_order(site, order_id, total, items)
-                        if success:
-                            st.success("已保存")
-                            st.session_state.sku_rows = [{"sku": "", "qty": 1}]
-                            st.rerun()
-                        else:
-                            st.error(msg)
-                    except Exception as e:
-                        st.error(f"保存失败: {e}")
+                try:
+                    success, msg = solver.db.add_order(site, order_id, total, items)
+                    if success:
+                        st.success("已保存")
+                        st.session_state.sku_rows = [{"sku": "", "qty": 1}]
+                        st.rerun()
+                    else:
+                        st.error(msg)
+                except Exception as e:
+                    st.error(f"保存失败: {e}")
 
 with right:
     try:
-        determined, conflicts, constraints, underdetermined, orders = solver.solve(site)
+        determined, conflicts, constraints, underdetermined, orders, inconsistent = solver.solve(site)
     except Exception as e:
         st.error(f"计算失败: {e}")
-        determined, conflicts, constraints, underdetermined, orders = {}, {}, [], [], []
+        determined, conflicts, constraints, underdetermined, orders, inconsistent = {}, {}, [], [], [], []
     
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("已确定", len(determined))
-    c2.metric("矛盾", len(conflicts))
-    c3.metric("约束", len(constraints))
-    c4.metric("订单", len(orders))
+    # 显示统计数据
+    c1, c2, c3 = st.columns(3)
+    c1.metric("已确定SKU", len(determined))
+    c2.metric("矛盾待解决", len(conflicts))
+    c3.metric("历史订单", len(orders))
     
-    st.divider()
-    
-    if determined:
-        st.subheader("✅ 已确定藏价")
-        data = []
-        for sku, (val, source) in determined.items():
-            if source == "manual":
-                src_display = "📝 手动确认"
-            elif source.startswith("derived_"):
-                oid = source.replace("derived_", "")
-                src_display = f"🤖 推导自 {oid}"
-            else:
-                src_display = source
-            data.append({"SKU": sku, "藏价": f"{val:.2f}", "来源": src_display})
-        
-        df = pd.DataFrame(data)
-        st.dataframe(df, use_container_width=True, hide_index=True)
-    
+    # 显示矛盾警告（红色大框）
     if conflicts:
-        st.subheader("⚠️ 发现价格矛盾！")
-        st.error("同一SKU在不同订单中推出不同值，请确认")
+        st.markdown("---")
+        st.error("⚠️ 发现价格矛盾！以下SKU推导出多个不同值")
         
         for sku, conflict_list in conflicts.items():
             with st.container(border=True):
-                st.markdown(f"**SKU: {sku}**")
+                st.markdown(f"#### SKU: {sku}")
                 
-                for c in conflict_list:
-                    st.markdown(f"- 订单 **{c['derived_from']}**: 推导值 **{c['value']:.2f}** ({c['equation']})")
+                # 显示所有可能的值
+                for i, c in enumerate(conflict_list, 1):
+                    st.markdown(f"**推导{i}**: {c['value']:.2f} ({c['equation']})")
                 
-                current_val, current_src = determined.get(sku, (0, "无"))
-                st.markdown(f"**当前采用**: {current_val:.2f} (来自{current_src})")
+                # 显示当前采用的值
+                current_val = determined.get(sku, "未确定")
+                st.markdown(f"**当前系统保留值**: {current_val if isinstance(current_val, str) else f'{current_val:.2f}'}")
                 
+                # 手动确认输入
+                st.markdown("---")
+                st.markdown("**手动确认最终值：**")
                 cols = st.columns([2, 1])
                 with cols[0]:
+                    # 默认取平均值或第一个冲突值
+                    default_val = sum(c['value'] for c in conflict_list) / len(conflict_list)
                     new_price = st.number_input(
-                        f"确认价_{sku}", 
+                        f"确认 {sku} 的藏价", 
                         min_value=0.0,
-                        value=float(conflict_list[0]['value']),
-                        step=1.0,
-                        key=f"manual_input_{sku}",
-                        label_visibility="collapsed"
+                        value=float(default_val),
+                        step=0.5,
+                        key=f"manual_{sku}"
                     )
                 with cols[1]:
                     if st.button(f"✓ 确认", key=f"confirm_{sku}", type="primary", use_container_width=True):
                         try:
                             solver.db.set_manual_price(site, sku, new_price)
-                            st.success(f"已确认 {sku}={new_price:.2f}")
+                            st.success(f"已确认 {sku} = {new_price:.2f}")
                             st.rerun()
                         except Exception as e:
-                            st.error(f"确认失败: {e}")
+                            st.error(f"失败: {e}")
                 
                 if st.button(f"🗑️ 清除手动确认", key=f"clear_{sku}"):
-                    try:
-                        solver.db.clear_manual_price(site, sku)
-                        st.rerun()
-                    except:
-                        pass
+                    solver.db.clear_manual_price(site, sku)
+                    st.rerun()
     
+    # 显示已确定价格
+    if determined and not conflicts:  # 没有矛盾时才显示确定列表（避免混淆）
+        st.markdown("---")
+        st.subheader("✅ 已确定藏价")
+        data = [{"SKU": k, "藏价": f"{v:.2f}"} for k, v in determined.items()]
+        st.dataframe(pd.DataFrame(data), use_container_width=True, hide_index=True)
+    
+    # 显示欠定约束
     if constraints:
-        st.subheader("🔗 欠定约束")
+        st.markdown("---")
+        st.subheader("🔗 欠定约束（需更多数据）")
         for cons in constraints:
-            with st.container(border=True):
-                st.markdown(f"**订单 {cons['order_id']}**: {cons['equation']}")
-                st.caption(f"涉及: {', '.join(cons['missing_skus'])}")
+            st.info(f"订单 {cons['order_id']}: {cons['equation']}")
+        st.caption(f"涉及待定SKU: {', '.join(underdetermined)}")
     
-    if not determined and not conflicts and not constraints:
-        st.info("录入第一个订单后开始计算")
-    
+    # 显示历史订单
     if orders:
-        st.divider()
+        st.markdown("---")
         st.subheader("📋 历史订单")
         
-        try:
-            _, items_data, _ = solver.db.get_site_data(site)
-        except:
-            items_data = []
+        _, items_data, _ = solver.db.get_site_data(site)
         
         for order in orders:
             oid = order['order_id']
-            order_items = [it for it in items_data if it['order_id'] == oid]
-            items_str = ", ".join([f"{it['sku']}×{it['quantity']}" for it in order_items])
+            o_items = [it for it in items_data if it['order_id'] == oid]
+            items_str = ", ".join([f"{it['sku']}×{it['quantity']}" for it in o_items])
             
             with st.container(border=True):
                 col1, col2, col3, col4 = st.columns([2, 3, 2, 1])
@@ -442,26 +413,23 @@ with right:
                     st.markdown(f"**{oid}**")
                     st.caption(f"{order['created_at'][:10]}")
                 with col2:
-                    st.text(items_str[:30] + "..." if len(items_str) > 30 else items_str)
+                    st.text(items_str[:25] + "..." if len(items_str) > 25 else items_str)
                 with col3:
                     st.markdown(f"{order['total_hidden_price']:.2f}")
                 with col4:
-                    confirm_key = f"conf_{oid}"
-                    if confirm_key not in st.session_state.delete_confirm:
-                        st.session_state.delete_confirm[confirm_key] = False
+                    ckey = f"del_{oid}"
+                    if ckey not in st.session_state.delete_confirm:
+                        st.session_state.delete_confirm[ckey] = False
                     
-                    if not st.session_state.delete_confirm[confirm_key]:
+                    if not st.session_state.delete_confirm[ckey]:
                         if st.button("🗑️", key=f"btn_{oid}"):
-                            st.session_state.delete_confirm[confirm_key] = True
+                            st.session_state.delete_confirm[ckey] = True
                             st.rerun()
                     else:
                         if st.button("✓", key=f"yes_{oid}", type="primary"):
-                            try:
-                                solver.db.delete_order(site, oid)
-                                st.session_state.delete_confirm[confirm_key] = False
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"删除失败: {e}")
+                            solver.db.delete_order(site, oid)
+                            st.session_state.delete_confirm[ckey] = False
+                            st.rerun()
                         if st.button("✕", key=f"no_{oid}"):
-                            st.session_state.delete_confirm[confirm_key] = False
+                            st.session_state.delete_confirm[ckey] = False
                             st.rerun()
