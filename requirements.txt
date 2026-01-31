@@ -1,5 +1,5 @@
-streamlit
-pandas
-numpy
-sqlalchemy
-psycopg2-binary
+streamlit>=1.28.0
+supabase>=2.0.0
+pandas>=1.5.0
+numpy>=1.24.0
+scipy>=1.10.0
